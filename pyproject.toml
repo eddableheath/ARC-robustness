@@ -1,0 +1,31 @@
+[project]
+name = "arc-robustness"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    # Core numerics
+    "numpy>=1.26",
+    "pandas>=2.2",
+    # ML / manifold visualisation
+    "scikit-learn>=1.4",
+    # Deep learning
+    "torch>=2.3",
+    "torchvision>=0.18",
+    # Plotting
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    # Notebooks
+    "jupyterlab>=4.0",
+    "ipykernel>=6.0",
+    "ipywidgets>=8.0",
+    # Utilities
+    "tqdm>=4.66",
+]
+
+[tool.uv]
+package = false  # no Python package to build; this is a notebook project
+
+# torch and torchvision are sourced from the default PyPI index.
+# The standard macOS wheels include MPS (Metal Performance Shaders) support,
+# so no custom index is needed. On a Linux/CUDA machine, add a
+# [[tool.uv.index]] entry pointing at https://download.pytorch.org/whl/cuXXX.
