@@ -185,3 +185,6 @@ cython_debug/
 
 # ignore .gif
 *.gif
+
+#ignore outputs
+outputs/*
