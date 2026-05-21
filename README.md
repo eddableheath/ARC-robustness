@@ -1,4 +1,4 @@
-# Visulasing Formalisms for Investigating Robustness to Evasion Attacks
+# Visualising Formalisms for Investigating Robustness to Evasion Attacks
 
 The goal here is to try and get some understanding of which formalism would be a good setting to prove some theorems with.
 
