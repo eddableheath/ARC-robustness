@@ -7,7 +7,11 @@ download MNIST, train for EPOCHS epochs, and save the weights to WEIGHTS_PATH.
 import torch
 import torchvision
 import torchvision.transforms as transforms
-from model import (
+from torch import nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from arc_robustness.training.model import (
     CLASSES,
     DATA_DIR,
     WEIGHTS_PATH,
@@ -15,8 +19,6 @@ from model import (
     filter_to_classes,
     remap_labels,
 )
-from torch import nn
-from torch.utils.data import DataLoader
 
 # ---------------------------------------------------------------------------
 # Hyper-parameters
@@ -65,10 +67,17 @@ def train() -> None:
     optimiser = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
 
-    for epoch in range(EPOCHS):
+    epoch_bar = tqdm(range(EPOCHS), desc="Epochs", unit="epoch")
+    for epoch in epoch_bar:
         model.train()
         running_loss = 0.0
-        for images, labels in train_loader:
+        batch_bar = tqdm(
+            train_loader,
+            desc=f"  Train {epoch + 1:>2}/{EPOCHS}",
+            leave=False,
+            unit="batch",
+        )
+        for images, labels in batch_bar:
             images = images.to(device)
             labels = remap_labels(labels, CLASSES).to(device)
             optimiser.zero_grad()
@@ -76,20 +85,27 @@ def train() -> None:
             loss.backward()
             optimiser.step()
             running_loss += loss.item()
+            batch_bar.set_postfix(loss=f"{loss.item():.4f}")
 
         model.eval()
         correct = total = 0
         with torch.no_grad():
-            for images, labels in val_loader:
+            for images, labels in tqdm(
+                val_loader,
+                desc=f"  Val   {epoch + 1:>2}/{EPOCHS}",
+                leave=False,
+                unit="batch",
+            ):
                 images = images.to(device)
                 labels = remap_labels(labels, CLASSES).to(device)
                 correct += (model(images).argmax(dim=1) == labels).sum().item()
                 total += labels.size(0)
 
-        print(
-            f"Epoch {epoch + 1:>2}/{EPOCHS} | "
-            f"loss: {running_loss / len(train_loader):.4f} | "
-            f"val acc: {correct / total:.4f}"
+        avg_loss = running_loss / len(train_loader)
+        val_acc = correct / total
+        epoch_bar.set_postfix(loss=f"{avg_loss:.4f}", val_acc=f"{val_acc:.4f}")
+        tqdm.write(
+            f"Epoch {epoch + 1:>2}/{EPOCHS} | loss: {avg_loss:.4f} | val acc: {val_acc:.4f}"
         )
 
     WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True)
