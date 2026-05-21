@@ -13,7 +13,7 @@ from torch.utils.data import Subset
 # Constants
 # ---------------------------------------------------------------------------
 
-CLASSES: list[int] = [0, 1, 2]
+CLASSES: list[int] = list(range(10))
 
 # Paths are anchored to the project root (four levels up from this file):
 #   training/ -> arc-robustness/ -> src/ -> ARC-robustness/
@@ -31,18 +31,20 @@ FEATURES_DIR: Path = _PROJECT_ROOT / "features"
 class DigitClassifier(nn.Module):
     """Four-hidden-layer dense classifier for MNIST digit recognition."""
 
-    def __init__(self, num_classes: int = 3) -> None:
+    def __init__(self, num_classes: int = 10) -> None:
         super().__init__()
         self.flatten = nn.Flatten()
         self.fc1 = nn.Linear(28 * 28, 512)
         self.relu1 = nn.ReLU()
-        self.fc2 = nn.Linear(512, 256)
+        self.fc2 = nn.Linear(512, 512)
         self.relu2 = nn.ReLU()
-        self.fc3 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(512, 256)
         self.relu3 = nn.ReLU()
-        self.fc4 = nn.Linear(128, 64)
+        self.fc4 = nn.Linear(256, 128)
         self.relu4 = nn.ReLU()
-        self.fc5 = nn.Linear(64, num_classes)
+        self.fc5 = nn.Linear(128, 64)
+        self.relu5 = nn.ReLU()
+        self.fc6 = nn.Linear(64, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.flatten(x)
@@ -50,7 +52,8 @@ class DigitClassifier(nn.Module):
         x = self.relu2(self.fc2(x))
         x = self.relu3(self.fc3(x))
         x = self.relu4(self.fc4(x))
-        return self.fc5(x)
+        x = self.relu5(self.fc5(x))
+        return self.fc6(x)
 
 
 # ---------------------------------------------------------------------------

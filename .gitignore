@@ -183,5 +183,5 @@ cython_debug/
 # Ignore .zip files
 *.zip
 
-# Ignore notebooks
-notebooks/
+# ignore .gif
+*.gif
