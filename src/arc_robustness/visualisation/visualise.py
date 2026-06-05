@@ -4,14 +4,13 @@ Visualisation code for manifolds.
 
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.manifold import Isomap
+import umap
 
 
-def visualise_manifold(data: np.ndarray, n_components: int = 2) -> Isomap.fit_transform:
-    """Visualise the manifold of the data using Isomap and return a projection."""
-    iso = Isomap(n_components=n_components)
-    projection = iso.fit_transform(data)
-    return projection
+def visualise_manifold(data: np.ndarray, n_components: int = 3) -> np.ndarray:
+    """Project *data* to *n_components* dimensions with UMAP and return the embedding."""
+    reducer = umap.UMAP(n_components=n_components, n_neighbors=15, min_dist=0.1)
+    return reducer.fit_transform(data)
 
 
 def visualise_projection(

@@ -1,6 +1,6 @@
 """
 Shared model definition and helpers used by both the training and feature-extraction
-scripts.
+scripts. Targets Fashion-MNIST classes: Pullover (2) and Shirt (6).
 """
 
 from pathlib import Path
@@ -13,7 +13,9 @@ from torch.utils.data import Subset
 # Constants
 # ---------------------------------------------------------------------------
 
-CLASSES: list[int] = list(range(10))
+# Fashion-MNIST: Pullover=2, Shirt=6 — the hardest-to-separate class pair.
+CLASSES: list[int] = [2, 6]
+CLASS_NAMES: list[str] = ["Pullover", "Shirt"]
 
 # Paths are anchored to the project root (four levels up from this file):
 #   training/ -> arc-robustness/ -> src/ -> ARC-robustness/
@@ -29,7 +31,7 @@ FEATURES_DIR: Path = _PROJECT_ROOT / "features"
 
 
 class DigitClassifier(nn.Module):
-    """Four-hidden-layer dense classifier for MNIST digit recognition."""
+    """Four-hidden-layer dense classifier for Fashion-MNIST binary classification."""
 
     def __init__(self, num_classes: int = 10) -> None:
         super().__init__()
@@ -40,11 +42,13 @@ class DigitClassifier(nn.Module):
         self.relu2 = nn.ReLU()
         self.fc3 = nn.Linear(512, 256)
         self.relu3 = nn.ReLU()
-        self.fc4 = nn.Linear(256, 128)
+        self.fc4 = nn.Linear(256, 256)
         self.relu4 = nn.ReLU()
-        self.fc5 = nn.Linear(128, 64)
+        self.fc5 = nn.Linear(256, 128)
         self.relu5 = nn.ReLU()
-        self.fc6 = nn.Linear(64, num_classes)
+        self.fc6 = nn.Linear(128, 64)
+        self.relu6 = nn.ReLU()
+        self.fc7 = nn.Linear(64, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.flatten(x)
@@ -53,7 +57,8 @@ class DigitClassifier(nn.Module):
         x = self.relu3(self.fc3(x))
         x = self.relu4(self.fc4(x))
         x = self.relu5(self.fc5(x))
-        return self.fc6(x)
+        x = self.relu6(self.fc6(x))
+        return self.fc7(x)
 
 
 # ---------------------------------------------------------------------------

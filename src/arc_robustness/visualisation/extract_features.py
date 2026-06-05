@@ -31,7 +31,7 @@ from arc_robustness.training.model import (
 )
 
 BATCH_SIZE = 256
-NORMALISE = transforms.Normalize((0.1307,), (0.3081,))
+NORMALISE = transforms.Normalize((0.2860,), (0.3530,))
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +64,7 @@ def extract_layer_features(
     features : dict[layer_name, ndarray of shape (N, units)]
         Post-ReLU activations collected over the full dataset.
     labels : ndarray of shape (N,)
-        Remapped ground-truth class indices (0, 1, 2).
+        Remapped ground-truth class indices (0=Pullover, 1=Shirt).
     """
     activations: dict[str, list[torch.Tensor]] = {}
     hooks = []
@@ -115,8 +115,8 @@ def main() -> None:
 
     loader = DataLoader(
         filter_to_classes(
-            torchvision.datasets.MNIST(
-                DATA_DIR, train=args.train, download=False, transform=transform
+            torchvision.datasets.FashionMNIST(
+                DATA_DIR, train=args.train, download=True, transform=transform
             ),
             CLASSES,
         ),

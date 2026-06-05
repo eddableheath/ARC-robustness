@@ -188,3 +188,9 @@ cython_debug/
 
 #ignore outputs
 outputs/*
+
+# ignore data
+data/*
+
+# ignore features
+features/*

@@ -1,7 +1,7 @@
 """
-Train a simple dense neural model on MNIST (classes 0, 1, 2), to be used as a base
-model for testing robustness to adversarial attacks.  Run this script directly to
-download MNIST, train for EPOCHS epochs, and save the weights to WEIGHTS_PATH.
+Train a simple dense neural model on Fashion-MNIST (Pullover vs Shirt), to be used as
+a base model for testing robustness to adversarial attacks.  Run this script directly
+to download Fashion-MNIST, train for EPOCHS epochs, and save weights to WEIGHTS_PATH.
 """
 
 import torch
@@ -27,7 +27,7 @@ from arc_robustness.training.model import (
 BATCH_SIZE = 64
 EPOCHS = 20
 LEARNING_RATE = 1e-3
-NORMALISE = transforms.Normalize((0.1307,), (0.3081,))
+NORMALISE = transforms.Normalize((0.2860,), (0.3530,))
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ def train() -> None:
 
     train_loader = DataLoader(
         filter_to_classes(
-            torchvision.datasets.MNIST(
+            torchvision.datasets.FashionMNIST(
                 DATA_DIR, train=True, download=True, transform=transform
             ),
             CLASSES,
@@ -51,7 +51,7 @@ def train() -> None:
     )
     val_loader = DataLoader(
         filter_to_classes(
-            torchvision.datasets.MNIST(
+            torchvision.datasets.FashionMNIST(
                 DATA_DIR, train=False, download=True, transform=transform
             ),
             CLASSES,

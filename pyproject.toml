@@ -15,6 +15,8 @@ dependencies = [
     "pandas>=2.2",
     # ML / manifold visualisation
     "scikit-learn>=1.4",
+    "scipy>=1.13",
+    "umap-learn>=0.5",
     # Deep learning
     "torch>=2.3",
     "torchvision>=0.18",

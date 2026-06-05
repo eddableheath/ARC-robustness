@@ -1,8 +1,13 @@
 """
-For the torchvision MNIST dataset (classes 0, 1, 2), run inference with the trained
-model, extract post-ReLU activations at each hidden layer, save them as .npy files,
-and produce an animated GIF showing the Isomap 2-D manifold projection evolving
-layer by layer through the network.
+For the torchvision Fashion-MNIST dataset (Pullover vs Shirt), run inference with the
+trained model, extract post-ReLU activations at each hidden layer, save them as .npy
+files, and produce an animated GIF showing the UMAP 3-D manifold projection evolving
+layer by layer.
+
+Each frame shows per-class convex hulls (optional) and an r-filtered kNN graph.
+All projections are Procrustes-aligned to the final layer to remove arbitrary
+orientation changes between frames. The final frames show the linear decision boundary;
+the last hold adds an edge-on view where the boundary collapses to a line.
 """
 
 import argparse
@@ -16,10 +21,16 @@ import numpy as np
 import torch
 import torchvision
 import torchvision.transforms as transforms
+from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
+from scipy.linalg import orthogonal_procrustes
+from scipy.spatial import ConvexHull, QhullError
+from sklearn.neighbors import kneighbors_graph
+from sklearn.svm import LinearSVC
 from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 
 from arc_robustness.training.model import (
+    CLASS_NAMES,
     CLASSES,
     DATA_DIR,
     FEATURES_DIR,
@@ -33,8 +44,6 @@ from arc_robustness.visualisation.visualise import visualise_manifold
 
 matplotlib.use("Agg")  # headless backend — must be set before importing pyplot
 
-# Isomap's internal k-NN graph construction triggers this scipy warning; it is
-# an implementation detail of sklearn and cannot be avoided from user code.
 warnings.filterwarnings("ignore", message="Changing the sparsity structure")
 
 # ---------------------------------------------------------------------------
@@ -42,10 +51,25 @@ warnings.filterwarnings("ignore", message="Changing the sparsity structure")
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 256
-DEFAULT_SAMPLES_PER_CLASS = 100
-NORMALISE = transforms.Normalize((0.1307,), (0.3081,))
+DEFAULT_SAMPLES_PER_CLASS = 200
+DEFAULT_KNN_K = 6
+DEFAULT_HOLD_FRAMES = 3
+NORMALISE = transforms.Normalize((0.2860,), (0.3530,))
 OUTPUTS_DIR = Path(__file__).resolve().parent.parent / "outputs"
-CMAP = matplotlib.colormaps.get_cmap("tab10").resampled(len(CLASSES))
+
+# Sample viridis at well-separated positions for maximum contrast with 2 classes.
+_v = matplotlib.colormaps["viridis"]
+CMAP = matplotlib.colors.ListedColormap([_v(0.1), _v(0.85)])
+_NORM = matplotlib.colors.Normalize(vmin=-0.5, vmax=len(CLASSES) - 0.5)
+
+# Sentinel for frame-sequence view mode
+_NORMAL = 0
+_EDGE_ON = 1
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def subsample_per_class(
@@ -61,8 +85,108 @@ def subsample_per_class(
         chosen = rng.choice(idx, size=min(n_per_class, len(idx)), replace=False)
         keep.extend(chosen.tolist())
     keep_arr = np.array(sorted(keep))
-    sub_features = {name: acts[keep_arr] for name, acts in features.items()}
-    return sub_features, labels[keep_arr]
+    return {name: acts[keep_arr] for name, acts in features.items()}, labels[keep_arr]
+
+
+def procrustes_align(projections: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Rotate each layer's projection to best match the final layer.
+
+    Uses orthogonal Procrustes (rotation + reflection only, no scale/translation)
+    so that the only motion between frames reflects genuine topology change.
+    """
+    layer_names = list(projections.keys())
+    final = projections[layer_names[-1]]
+    ref = final - final.mean(axis=0)
+
+    aligned: dict[str, np.ndarray] = {}
+    for name in layer_names:
+        proj = projections[name]
+        p = proj - proj.mean(axis=0)
+        R, _ = orthogonal_procrustes(p, ref)
+        aligned[name] = p @ R
+    return aligned
+
+
+def build_class_edges(
+    proj: np.ndarray,
+    labels: np.ndarray,
+    k: int,
+    r_thresh: float | None,
+) -> tuple[list, list]:
+    """Return (segments, colors) for kNN edges within each class, optionally filtered
+    to pairs whose Euclidean distance is at most r_thresh * overall_diameter."""
+    segments: list = []
+    colors: list = []
+    abs_r: float | None = None
+    if r_thresh is not None:
+        diameter = float(np.linalg.norm(proj.max(axis=0) - proj.min(axis=0)))
+        abs_r = r_thresh * diameter
+    for cls in np.unique(labels):
+        pts = proj[labels == cls]
+        if len(pts) <= k:
+            continue
+        graph = kneighbors_graph(
+            pts, n_neighbors=k, mode="distance", include_self=False
+        )
+        rows, cols = graph.nonzero()
+        color = CMAP(_NORM(cls))
+        for src, dst in zip(rows, cols):
+            if src < dst:
+                if abs_r is None or float(graph[src, dst]) <= abs_r:
+                    segments.append([pts[src], pts[dst]])
+                    colors.append(color)
+    return segments, colors
+
+
+def draw_class_hull(ax, pts: np.ndarray, color: tuple, alpha: float = 0.12) -> None:
+    """Add the convex hull of pts as a transparent triangulated surface to ax."""
+    try:
+        hull = ConvexHull(pts)
+    except QhullError:
+        return
+    poly = Poly3DCollection(pts[hull.simplices], linewidth=0.2)
+    poly.set_facecolor((*color[:3], alpha))
+    poly.set_edgecolor((*color[:3], 0.18))
+    ax.add_collection3d(poly)
+
+
+def draw_decision_boundary(
+    ax,
+    proj: np.ndarray,
+    w: np.ndarray,
+    b: float,
+    margin: float = 0.1,
+) -> None:
+    """Draw the linear SVM decision plane given precomputed coefficients w, b."""
+    if abs(w[2]) < 1e-6:
+        return  # plane nearly parallel to z-axis
+    pad = margin * (proj.max(axis=0) - proj.min(axis=0))
+    xx, yy = np.meshgrid(
+        np.linspace(proj[:, 0].min() - pad[0], proj[:, 0].max() + pad[0], 35),
+        np.linspace(proj[:, 1].min() - pad[1], proj[:, 1].max() + pad[1], 35),
+    )
+    zz = np.clip(
+        -(w[0] * xx + w[1] * yy + b) / w[2],
+        proj[:, 2].min() - pad[2],
+        proj[:, 2].max() + pad[2],
+    )
+    ax.plot_surface(
+        xx, yy, zz, color="white", alpha=0.35, linewidth=0, antialiased=True
+    )
+    ax.plot_wireframe(
+        xx, yy, zz, color="dimgray", linewidth=0.6, alpha=0.7, rstride=4, cstride=4
+    )
+
+
+def compute_edge_on_view(w: np.ndarray) -> tuple[float, float]:
+    """Return (elev, azim) so the plane with normal w appears edge-on (as a line).
+
+    At elev=0 the matplotlib camera looks along d = [-sin(a), cos(a), 0].
+    Setting d · w_hat = 0 gives azim = atan2(w[1], w[0]).
+    """
+    w_hat = w / (np.linalg.norm(w) + 1e-10)
+    azim = float(np.degrees(np.arctan2(w_hat[1], w_hat[0])))
+    return 0.0, azim + 90
 
 
 # ---------------------------------------------------------------------------
@@ -72,14 +196,43 @@ def subsample_per_class(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Visualise layer manifolds for MNIST classes 0-2."
+        description="Visualise layer manifolds for Fashion-MNIST Pullover vs Shirt."
     )
     parser.add_argument(
         "--samples-per-class",
         type=int,
         default=DEFAULT_SAMPLES_PER_CLASS,
         metavar="N",
-        help=f"Samples per class used for Isomap / animation (default: {DEFAULT_SAMPLES_PER_CLASS}).",
+        help=f"Samples per class used for UMAP / animation (default: {DEFAULT_SAMPLES_PER_CLASS}).",
+    )
+    parser.add_argument(
+        "--knn-k",
+        type=int,
+        default=DEFAULT_KNN_K,
+        metavar="K",
+        help=f"Neighbours per point in the within-class kNN graph (default: {DEFAULT_KNN_K}).",
+    )
+    parser.add_argument(
+        "--r-thresh",
+        type=float,
+        default=None,
+        metavar="R",
+        help=(
+            "Maximum edge length as a fraction of the overall point-cloud diameter "
+            "(e.g. 0.15 = 15%%). Disabled by default (pure kNN, no distance filter)."
+        ),
+    )
+    parser.add_argument(
+        "--no-hull",
+        action="store_true",
+        help="Skip drawing convex hulls; show only graph edges and points.",
+    )
+    parser.add_argument(
+        "--hold-frames",
+        type=int,
+        default=DEFAULT_HOLD_FRAMES,
+        metavar="H",
+        help=f"Extra frames to hold on the final layer, both normal and edge-on (default: {DEFAULT_HOLD_FRAMES}).",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for subsampling."
@@ -88,18 +241,17 @@ def main() -> None:
 
     transform = transforms.Compose([transforms.ToTensor(), NORMALISE])
 
-    # Combine both splits, filtered to the three target classes
     full_dataset = ConcatDataset(
         [
             filter_to_classes(
-                torchvision.datasets.MNIST(
+                torchvision.datasets.FashionMNIST(
                     DATA_DIR, train=True, download=True, transform=transform
                 ),
                 CLASSES,
             ),
             filter_to_classes(
-                torchvision.datasets.MNIST(
-                    DATA_DIR, train=False, download=False, transform=transform
+                torchvision.datasets.FashionMNIST(
+                    DATA_DIR, train=False, download=True, transform=transform
                 ),
                 CLASSES,
             ),
@@ -111,8 +263,8 @@ def main() -> None:
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(
-        f"Running inference on {device}  ",
-        f"({len(full_dataset):,} samples, classes {CLASSES})",
+        f"Running inference on {device}  "
+        f"({len(full_dataset):,} samples, classes {CLASS_NAMES})"
     )
 
     model = load_model(device)
@@ -130,62 +282,125 @@ def main() -> None:
     print(f"Features saved to {out_dir}\n")
 
     # ------------------------------------------------------------------
-    # Subsample for Isomap (keeps full features on disk)
+    # Subsample for UMAP (keeps full features on disk)
     # ------------------------------------------------------------------
     rng = np.random.default_rng(args.seed)
     vis_features, vis_labels = subsample_per_class(
         features, labels, args.samples_per_class, rng
     )
-    total_vis = len(vis_labels)
     print(
         f"Subsampled to {args.samples_per_class} per class "
-        f"({total_vis} points total) for Isomap.\n"
+        f"({len(vis_labels)} points total) for UMAP.\n"
     )
 
     # ------------------------------------------------------------------
-    # Compute Isomap projections (one per layer)
+    # Compute UMAP projections (one per layer, 3-D)
     # ------------------------------------------------------------------
     layer_names = list(vis_features.keys())
-    projections: dict[str, np.ndarray] = {}
-    for layer_name in tqdm(layer_names, desc="Isomap projections"):
-        projections[layer_name] = visualise_manifold(vis_features[layer_name])
+    raw_projections: dict[str, np.ndarray] = {}
+    for layer_name in tqdm(layer_names, desc="UMAP projections"):
+        raw_projections[layer_name] = visualise_manifold(
+            vis_features[layer_name], n_components=3
+        )
 
     # ------------------------------------------------------------------
-    # Build animation
+    # Procrustes-align all layers to the final layer so inter-frame
+    # motion reflects genuine topology change, not arbitrary orientation.
     # ------------------------------------------------------------------
-    fig = plt.figure(figsize=(8, 6))
+    projections = procrustes_align(raw_projections)
+    print("Projections Procrustes-aligned to final layer.\n")
+
+    # ------------------------------------------------------------------
+    # Pre-compute graph edges and fit the final-layer decision boundary
+    # ------------------------------------------------------------------
+    layer_edges: dict[str, tuple[list, list]] = {
+        name: build_class_edges(
+            projections[name], vis_labels, args.knn_k, args.r_thresh
+        )
+        for name in layer_names
+    }
+
+    final_proj = projections[layer_names[-1]]
+    svc = LinearSVC(dual="auto", max_iter=5000).fit(final_proj, vis_labels)
+    w_final = svc.coef_[0]
+    b_final = float(svc.intercept_[0])
+    edge_on_elev, edge_on_azim = compute_edge_on_view(w_final)
+    print(
+        f"Decision boundary fitted. Edge-on view: elev={edge_on_elev:.1f}°, "
+        f"azim={edge_on_azim:.1f}°\n"
+    )
+
+    # ------------------------------------------------------------------
+    # Build frame sequence:
+    #   layer-by-layer → hold on final (normal view) → hold on final (edge-on)
+    # ------------------------------------------------------------------
+    n = len(layer_names)
+    frame_sequence: list[tuple[int, int]] = (
+        [(i, _NORMAL) for i in range(n)]
+        + [(n - 1, _NORMAL)] * args.hold_frames
+        + [(n - 1, _EDGE_ON)] * args.hold_frames
+    )
+
+    fig = plt.figure(figsize=(9, 7))
     gs = fig.add_gridspec(1, 2, width_ratios=[20, 1], wspace=0.05)
-    ax = fig.add_subplot(gs[0])
+    ax = fig.add_subplot(gs[0], projection="3d")
     cax = fig.add_subplot(gs[1])
 
-    sm = plt.cm.ScalarMappable(
-        cmap=CMAP,
-        norm=plt.Normalize(vmin=-0.5, vmax=len(CLASSES) - 0.5),
-    )
-    fig.colorbar(sm, cax=cax, ticks=range(len(CLASSES)), label="digit class")
+    sm = plt.cm.ScalarMappable(cmap=CMAP, norm=_NORM)
+    cb = fig.colorbar(sm, cax=cax, ticks=range(len(CLASSES)))
+    cb.set_ticklabels(CLASS_NAMES)
 
     def draw_frame(i: int) -> None:
         ax.clear()
-        layer_name = layer_names[i]
+        layer_idx, view_mode = frame_sequence[i]
+        layer_name = layer_names[layer_idx]
         proj = projections[layer_name]
+        is_final = layer_idx == n - 1
+
+        if not args.no_hull:
+            for cls in np.unique(vis_labels):
+                draw_class_hull(ax, proj[vis_labels == cls], CMAP(_NORM(cls)))
+
+        segments, colors = layer_edges[layer_name]
+        if segments:
+            ax.add_collection3d(
+                Line3DCollection(segments, colors=colors, linewidths=0.4, alpha=0.3)
+            )
+
         ax.scatter(
             proj[:, 0],
             proj[:, 1],
+            proj[:, 2],
             c=vis_labels,
             cmap=CMAP,
-            vmin=-0.5,
-            vmax=len(CLASSES) - 0.5,
-            s=3,
+            norm=_NORM,
+            s=4,
             lw=0,
-            alpha=0.6,
+            alpha=0.5,
         )
-        ax.set_title(f"Layer {i + 1}/{len(layer_names)}: {layer_name}", fontsize=12)
-        ax.axis("off")
+
+        if is_final:
+            draw_decision_boundary(ax, proj, w_final, b_final)
+
+        title = f"Layer {layer_idx + 1}/{n}: {layer_name}"
+        if view_mode == _EDGE_ON:
+            title += "  [edge-on boundary]"
+        elif is_final:
+            title += "  [decision boundary]"
+        ax.set_title(title, fontsize=12)
+        ax.set_xlabel("UMAP 1", fontsize=8)
+        ax.set_ylabel("UMAP 2", fontsize=8)
+        ax.set_zlabel("UMAP 3", fontsize=8)
+
+        if view_mode == _EDGE_ON:
+            ax.view_init(elev=edge_on_elev, azim=edge_on_azim)
+        else:
+            ax.view_init(elev=20, azim=45 + layer_idx * (180 / max(n - 1, 1)))
 
     ani = animation.FuncAnimation(
         fig,
         draw_frame,
-        frames=len(layer_names),
+        frames=len(frame_sequence),
         interval=1500,
         repeat=True,
     )
