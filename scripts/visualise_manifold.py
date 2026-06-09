@@ -155,27 +155,46 @@ def draw_decision_boundary(
     proj: np.ndarray,
     w: np.ndarray,
     b: float,
-    margin: float = 0.1,
+    margin: float = 0.2,
 ) -> None:
-    """Draw the linear SVM decision plane given precomputed coefficients w, b."""
-    if abs(w[2]) < 1e-6:
-        return  # plane nearly parallel to z-axis
-    pad = margin * (proj.max(axis=0) - proj.min(axis=0))
-    xx, yy = np.meshgrid(
-        np.linspace(proj[:, 0].min() - pad[0], proj[:, 0].max() + pad[0], 35),
-        np.linspace(proj[:, 1].min() - pad[1], proj[:, 1].max() + pad[1], 35),
-    )
-    zz = np.clip(
-        -(w[0] * xx + w[1] * yy + b) / w[2],
-        proj[:, 2].min() - pad[2],
-        proj[:, 2].max() + pad[2],
-    )
-    ax.plot_surface(
-        xx, yy, zz, color="white", alpha=0.35, linewidth=0, antialiased=True
-    )
-    ax.plot_wireframe(
-        xx, yy, zz, color="dimgray", linewidth=0.6, alpha=0.7, rstride=4, cstride=4
-    )
+    """Decision plane as a patch parameterised in the plane's own coordinates.
+
+    Works regardless of orientation — no z-clipping or masking so the boundary
+    always renders in full.  The patch is sized to cover the full data extent
+    projected onto the plane, plus *margin*.
+    """
+    w_norm = float(np.linalg.norm(w))
+    if w_norm < 1e-10:
+        return
+
+    n = w / w_norm  # unit normal
+
+    # Point on the plane nearest to the data centroid
+    centroid = proj.mean(axis=0)
+    p0 = centroid - (float(n @ centroid) + b / w_norm) * n
+
+    # Two orthogonal unit vectors spanning the plane
+    ref = np.array([0.0, 0.0, 1.0]) if abs(n[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    u = np.cross(n, ref)
+    u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+
+    # Patch radius: cover the full data footprint projected onto the plane
+    d = proj - p0
+    R = float(max(np.abs(d @ u).max(), np.abs(d @ v).max())) * (1.0 + margin)
+
+    ss, tt = np.meshgrid(np.linspace(-R, R, 50), np.linspace(-R, R, 50))
+    pts = p0 + ss[..., np.newaxis] * u + tt[..., np.newaxis] * v  # (50, 50, 3)
+    xx, yy, zz = pts[..., 0], pts[..., 1], pts[..., 2]
+
+    ax.plot_surface(xx, yy, zz, color="white", alpha=0.35, linewidth=0, antialiased=True)
+    ax.plot_wireframe(xx, yy, zz, color="dimgray", linewidth=0.6, alpha=0.7, rstride=3, cstride=3)
+
+    # Restore data-based axis limits so the patch doesn't push the view out
+    pad_ax = 0.1 * (proj.max(axis=0) - proj.min(axis=0))
+    ax.set_xlim(proj[:, 0].min() - pad_ax[0], proj[:, 0].max() + pad_ax[0])
+    ax.set_ylim(proj[:, 1].min() - pad_ax[1], proj[:, 1].max() + pad_ax[1])
+    ax.set_zlim(proj[:, 2].min() - pad_ax[2], proj[:, 2].max() + pad_ax[2])
 
 
 def compute_edge_on_view(w: np.ndarray) -> tuple[float, float]:

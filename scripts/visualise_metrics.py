@@ -42,6 +42,14 @@ from sklearn.svm import LinearSVC
 from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 
+from arc_robustness.analysis.community import curvature_gap, modularity
+from arc_robustness.analysis.evolution import local_ricci_evolution
+from arc_robustness.analysis.graph_utils import build_knn_graph
+from arc_robustness.analysis.ricci import (
+    forman_ricci,
+    ollivier_ricci,
+    vertex_curvature,
+)
 from arc_robustness.training.model import (
     CLASS_NAMES,
     CLASSES,
@@ -62,6 +70,7 @@ BATCH_SIZE = 256
 DEFAULT_SAMPLES_PER_CLASS = 200
 NORMALISE = transforms.Normalize((0.2860,), (0.3530,))
 OUTPUTS_DIR = Path(__file__).resolve().parent.parent / "outputs"
+ADV_DIR = OUTPUTS_DIR / "adversarial"
 
 # Class colour map — matches visualise_manifold.py
 _v = matplotlib.colormaps["viridis"]
@@ -186,21 +195,44 @@ def _draw_boundary(
     b: float,
     margin: float = 0.1,
 ) -> None:
-    """Linear SVM decision plane given pre-fitted coefficients w, b."""
-    if abs(w[2]) < 1e-6:
+    """Decision plane as a patch parameterised in the plane's own coordinates.
+
+    Works regardless of how the plane is oriented — no z-clipping or masking,
+    so the boundary always renders in full.  The patch is sized to cover the
+    full extent of the projected data plus *margin*.
+    """
+    w_norm = float(np.linalg.norm(w))
+    if w_norm < 1e-10:
         return
-    pad = margin * (proj.max(axis=0) - proj.min(axis=0))
-    xx, yy = np.meshgrid(
-        np.linspace(proj[:, 0].min() - pad[0], proj[:, 0].max() + pad[0], 35),
-        np.linspace(proj[:, 1].min() - pad[1], proj[:, 1].max() + pad[1], 35),
-    )
-    zz = np.clip(
-        -(w[0] * xx + w[1] * yy + b) / w[2],
-        proj[:, 2].min() - pad[2],
-        proj[:, 2].max() + pad[2],
-    )
+
+    n = w / w_norm  # unit normal to the plane
+
+    # Point on the plane nearest to the data centroid
+    centroid = proj.mean(axis=0)
+    p0 = centroid - (float(n @ centroid) + b / w_norm) * n
+
+    # Two orthogonal unit vectors spanning the plane
+    ref = np.array([0.0, 0.0, 1.0]) if abs(n[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    u = np.cross(n, ref)
+    u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+
+    # Patch radius: cover the full data footprint projected onto the plane
+    d = proj - p0
+    R = float(max(np.abs(d @ u).max(), np.abs(d @ v).max())) * (1.0 + margin)
+
+    ss, tt = np.meshgrid(np.linspace(-R, R, 50), np.linspace(-R, R, 50))
+    pts = p0 + ss[..., np.newaxis] * u + tt[..., np.newaxis] * v  # (50, 50, 3)
+    xx, yy, zz = pts[..., 0], pts[..., 1], pts[..., 2]
+
     ax.plot_surface(xx, yy, zz, color="white", alpha=0.35, linewidth=0, antialiased=True)
-    ax.plot_wireframe(xx, yy, zz, color="dimgray", linewidth=0.6, alpha=0.7, rstride=4, cstride=4)
+    ax.plot_wireframe(xx, yy, zz, color="dimgray", linewidth=0.6, alpha=0.7, rstride=3, cstride=3)
+
+    # Restore data-based axis limits so the patch doesn't push the view out
+    pad_ax = 0.1 * (proj.max(axis=0) - proj.min(axis=0))
+    ax.set_xlim(proj[:, 0].min() - pad_ax[0], proj[:, 0].max() + pad_ax[0])
+    ax.set_ylim(proj[:, 1].min() - pad_ax[1], proj[:, 1].max() + pad_ax[1])
+    ax.set_zlim(proj[:, 2].min() - pad_ax[2], proj[:, 2].max() + pad_ax[2])
 
 
 def _compute_edge_on_view(w: np.ndarray) -> tuple[float, float]:
@@ -219,6 +251,236 @@ _EDGE_ON = 1
 # Figure 2: combined manifold + metric line-plot animation
 # ---------------------------------------------------------------------------
 
+def _compute_combined_umap(
+    features_clean: dict[str, np.ndarray],
+    features_adv: dict[str, np.ndarray],
+    layer_names: list[str],
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """UMAP on clean + adversarial concatenated per layer, Procrustes-aligned.
+
+    Both sets share the same rotation (derived from clean projections) so the
+    clean manifold remains comparable across runs. Adversarial points are
+    centred on the clean centroid before rotation, placing them in the same
+    coordinate frame.
+    """
+    N_c = next(iter(features_clean.values())).shape[0]
+
+    raw_clean: dict[str, np.ndarray] = {}
+    raw_adv: dict[str, np.ndarray] = {}
+    for name in tqdm(layer_names, desc="UMAP (clean+adv)"):
+        combined = np.concatenate([features_clean[name], features_adv[name]], axis=0)
+        proj = visualise_manifold(combined, n_components=3)
+        raw_clean[name] = proj[:N_c]
+        raw_adv[name] = proj[N_c:]
+
+    # Procrustes reference: centred final clean layer
+    final_c = raw_clean[layer_names[-1]]
+    ref = final_c - final_c.mean(axis=0)
+
+    proj_clean: dict[str, np.ndarray] = {}
+    proj_adv: dict[str, np.ndarray] = {}
+    for name in layer_names:
+        centroid = raw_clean[name].mean(axis=0)
+        c = raw_clean[name] - centroid
+        R, _ = orthogonal_procrustes(c, ref)
+        proj_clean[name] = c @ R
+        # Centre adversarial on the same clean centroid, apply same rotation
+        proj_adv[name] = (raw_adv[name] - centroid) @ R
+
+    return proj_clean, proj_adv
+
+
+# ---------------------------------------------------------------------------
+# Adversarial Ricci analysis
+# ---------------------------------------------------------------------------
+
+def compute_layer_metrics(
+    features: dict[str, np.ndarray],
+    labels: np.ndarray,
+    knn_k: int,
+    skip_ollivier: bool = False,
+) -> dict:
+    """Run the full Ricci/community pipeline on a feature dict.
+
+    Returns a dict with keys matching ricci_metrics.npz where useful:
+      mean_kappa, modularity, gap_ollivier, gap_forman, rho, r_layer, used_ollivier
+    """
+    layer_names = list(features.keys())
+    N = len(labels)
+    L = len(layer_names)
+
+    adjs: dict = {}
+    forman_curv: dict = {}
+    ollivier_curv: dict = {}
+    vert_forman: dict = {}
+    vert_ollivier: dict = {}
+    Q_arr = np.zeros(L)
+    gap_forman_arr = np.full(L, np.nan)
+    gap_ollivier_arr = np.full(L, np.nan)
+
+    for i, name in enumerate(tqdm(layer_names, desc="  layers", leave=False)):
+        pts = features[name]
+        adj = build_knn_graph(pts, knn_k)
+        adjs[name] = adj
+
+        fr = forman_ricci(adj)
+        forman_curv[name] = fr
+        vert_forman[name] = vertex_curvature(fr, N)
+
+        if not skip_ollivier:
+            orr = ollivier_ricci(adj, pts)
+            ollivier_curv[name] = orr
+            vert_ollivier[name] = vertex_curvature(orr, N)
+        else:
+            ollivier_curv[name] = {}
+            vert_ollivier[name] = np.full(N, np.nan)
+
+        Q_arr[i] = modularity(adj, labels)
+        gap_forman_arr[i] = curvature_gap(fr, labels)
+        if not skip_ollivier:
+            gap_ollivier_arr[i] = curvature_gap(ollivier_curv[name], labels)
+
+    rho = np.full(N, np.nan)
+    r_layer = np.full(L - 1, np.nan)
+    if not skip_ollivier:
+        rho, r_layer = local_ricci_evolution(features, adjs, ollivier_curv)
+
+    mean_kappa = np.array([
+        np.nanmean(vert_ollivier[n]) if not skip_ollivier else np.nanmean(vert_forman[n])
+        for n in layer_names
+    ])
+
+    return {
+        "layer_names": layer_names,
+        "mean_kappa": mean_kappa,
+        "modularity": Q_arr,
+        "gap_ollivier": gap_ollivier_arr,
+        "gap_forman": gap_forman_arr,
+        "rho": rho,
+        "r_layer": r_layer,
+        "used_ollivier": not skip_ollivier,
+    }
+
+
+def plot_adversarial_ricci_comparison(
+    clean_data: dict,
+    adv_metrics: dict,
+    out_path: Path,
+    epsilon: float,
+) -> None:
+    """4-panel static figure comparing clean vs adversarial Ricci metrics.
+
+    Panels:
+      (0,0) Mean curvature κ̄ per layer
+      (0,1) Curvature gap ΔO per layer
+      (1,0) Modularity Q per layer
+      (1,1) ρ(x) distribution — violin plot
+    """
+    layer_names = list(clean_data["layer_names"])
+    L = len(layer_names)
+    x = np.arange(L)
+    tick_labels = [n.replace("relu", "L") for n in layer_names]
+
+    used_ollivier = bool(clean_data.get("used_ollivier", False))
+    kappa_label = "mean Ollivier κ̄" if used_ollivier else "mean Forman κ̄"
+
+    # Pull clean metrics from the saved npz
+    if "mean_kappa" in clean_data:
+        clean_kappa = np.array(clean_data["mean_kappa"], dtype=float)
+    elif used_ollivier:
+        clean_kappa = np.nanmean(clean_data["vertex_ollivier"], axis=1).astype(float)
+    else:
+        clean_kappa = np.nanmean(clean_data["vertex_forman"], axis=1).astype(float)
+
+    clean_Q = np.array(clean_data["modularity"], dtype=float)
+    clean_gap = np.array(
+        clean_data.get("curvature_gap_ollivier", clean_data.get("curvature_gap_forman")),
+        dtype=float,
+    )
+    clean_rho = np.array(clean_data["rho"], dtype=float) if "rho" in clean_data else None
+
+    adv_kappa = adv_metrics["mean_kappa"]
+    adv_Q = adv_metrics["modularity"]
+    adv_gap = adv_metrics["gap_ollivier"] if adv_metrics["used_ollivier"] else adv_metrics["gap_forman"]
+    adv_rho = adv_metrics["rho"]
+
+    C_CLEAN = "#1565C0"   # dark blue
+    C_ADV   = "#C62828"   # dark red
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle(
+        f"Adversarial Ricci analysis  —  clean vs FGSM ε={epsilon:.3f}",
+        fontsize=13, fontweight="bold",
+    )
+
+    def _line_panel(ax, clean_vals, adv_vals, ylabel, title):
+        ax.plot(x, clean_vals, "o-", color=C_CLEAN, lw=2, ms=6, label="clean")
+        ax.plot(x, adv_vals,   "s--", color=C_ADV,   lw=2, ms=6, label=f"adv ε={epsilon:.3f}")
+        ax.axhline(0, color="black", ls=":", lw=0.8, alpha=0.4)
+        ax.set_xticks(x)
+        ax.set_xticklabels(tick_labels, fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_title(title, fontsize=10)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    _line_panel(axes[0, 0], clean_kappa, adv_kappa, kappa_label, kappa_label + " per layer")
+    _line_panel(axes[0, 1], clean_gap,   adv_gap,   "ΔO",         "Curvature gap ΔO per layer")
+    _line_panel(axes[1, 0], clean_Q,     adv_Q,     "Q",          "Modularity Q per layer")
+
+    # ρ(x) violin comparison
+    ax_v = axes[1, 1]
+    rho_data = []
+    rho_positions = []
+    rho_colors = []
+    rho_labels = []
+    if clean_rho is not None and not np.all(np.isnan(clean_rho)):
+        clean_finite = clean_rho[np.isfinite(clean_rho)]
+        rho_data.append(clean_finite)
+        rho_positions.append(1)
+        rho_colors.append(C_CLEAN)
+        rho_labels.append("clean")
+    if not np.all(np.isnan(adv_rho)):
+        adv_finite = adv_rho[np.isfinite(adv_rho)]
+        rho_data.append(adv_finite)
+        rho_positions.append(2)
+        rho_colors.append(C_ADV)
+        rho_labels.append(f"adv ε={epsilon:.3f}")
+
+    if rho_data:
+        parts = ax_v.violinplot(rho_data, positions=rho_positions, showmedians=True)
+        for body, color in zip(parts["bodies"], rho_colors):
+            body.set_facecolor(color)
+            body.set_alpha(0.55)
+        parts["cmedians"].set_colors(rho_colors)
+        parts["cbars"].set_colors(rho_colors)
+        parts["cmins"].set_colors(rho_colors)
+        parts["cmaxes"].set_colors(rho_colors)
+
+        ax_v.set_xticks(rho_positions)
+        ax_v.set_xticklabels(rho_labels, fontsize=9)
+        for pos, vals, color in zip(rho_positions, rho_data, rho_colors):
+            frac_neg = (vals < 0).mean()
+            ax_v.text(
+                pos, ax_v.get_ylim()[0] if ax_v.get_ylim()[0] != ax_v.get_ylim()[1] else -1,
+                f"{frac_neg:.0%} ρ<0",
+                ha="center", va="bottom", fontsize=8, color=color,
+            )
+    else:
+        ax_v.text(0.5, 0.5, "ρ(x) not available\n(skip_ollivier was set)",
+                  ha="center", va="center", transform=ax_v.transAxes, fontsize=9, color="gray")
+
+    ax_v.axhline(0, color="black", ls=":", lw=0.8, alpha=0.4)
+    ax_v.set_ylabel("ρ(x)", fontsize=9)
+    ax_v.set_title("ρ(x) distribution", fontsize=10)
+    ax_v.grid(True, alpha=0.3, axis="y")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Adversarial Ricci comparison saved to {out_path}")
+
+
 def make_combined_gif(
     data: dict,
     features: dict | None,
@@ -226,12 +488,22 @@ def make_combined_gif(
     out_path: Path,
     knn_k: int = 6,
     hold_frames: int = 3,
+    adv_features: dict | None = None,
+    adv_epsilon: float | None = None,
+    adv_labels: np.ndarray | None = None,
 ) -> None:
     layer_names = list(data["layer_names"])
     L = len(layer_names)
 
     # ---- UMAP projections -----------------------------------------------
-    if "umap_projections" in data:
+    adv_projections: dict[str, np.ndarray] | None = None
+
+    if adv_features is not None:
+        # Always recompute UMAP so clean and adversarial share a coordinate frame
+        projections, adv_projections = _compute_combined_umap(
+            features, adv_features, layer_names,
+        )
+    elif "umap_projections" in data:
         umap_stack = data["umap_projections"]  # (L, N, 3)
         projections = {n: umap_stack[i] for i, n in enumerate(layer_names)}
     else:
@@ -369,6 +641,16 @@ def make_combined_gif(
         )
         for cls_idx, cls in enumerate(unique_cls)
     ]
+    if adv_projections is not None:
+        eps_label = f"ε={adv_epsilon:.2f}" if adv_epsilon is not None else "adv"
+        for cls_idx, cls in enumerate(np.unique(labels)):
+            legend_handles.append(
+                Line2D(
+                    [0], [0], marker="x", color=CLASS_CMAP(CLASS_NORM(cls)),
+                    linestyle="None", markersize=7, markeredgewidth=1.5,
+                    label=f"{CLASS_NAMES[cls_idx]} adv ({eps_label})",
+                )
+            )
 
     def draw_frame(i: int) -> None:
         layer_idx, view_mode = frame_seq[i]
@@ -391,6 +673,17 @@ def make_combined_gif(
             c=labels, cmap=CLASS_CMAP, norm=CLASS_NORM,
             s=5, lw=0, alpha=0.6,
         )
+
+        if adv_projections is not None:
+            adv_proj = adv_projections[name]
+            cls_labels = adv_labels if adv_labels is not None else labels
+            for cls in np.unique(cls_labels):
+                mask = cls_labels == cls
+                color = CLASS_CMAP(CLASS_NORM(cls))
+                ax_main.scatter(
+                    adv_proj[mask, 0], adv_proj[mask, 1], adv_proj[mask, 2],
+                    color=color, marker="x", s=20, linewidths=1.2, alpha=0.65,
+                )
 
         if show_boundary:
             _draw_boundary(ax_main, proj, w, b)
@@ -455,6 +748,31 @@ def main() -> None:
         "--samples-per-class", type=int, default=DEFAULT_SAMPLES_PER_CLASS, metavar="N"
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--adv-epsilon",
+        type=float,
+        default=None,
+        metavar="ε",
+        help=(
+            "Overlay adversarial examples from outputs/adversarial/eps_{ε:.3f}/ "
+            "on the manifold animation. Requires generate_adversarial.py to have "
+            "been run with this ε first."
+        ),
+    )
+    parser.add_argument(
+        "--ricci-analysis",
+        action="store_true",
+        help=(
+            "Compute Ricci/community metrics for adversarial features and produce "
+            "a comparison figure (requires --adv-epsilon). Ollivier-Ricci is "
+            "computed by default; use --skip-ollivier for a faster Forman-only run."
+        ),
+    )
+    parser.add_argument(
+        "--skip-ollivier",
+        action="store_true",
+        help="Use Forman-Ricci instead of Ollivier-Ricci for --ricci-analysis (much faster).",
+    )
     args = parser.parse_args()
 
     metrics_path = OUTPUTS_DIR / "ricci_metrics.npz"
@@ -470,13 +788,72 @@ def main() -> None:
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     plot_community_metrics(data, OUTPUTS_DIR / "community_metrics.png")
 
+    # ---- Adversarial Ricci analysis ----------------------------------------
+    if args.ricci_analysis:
+        if args.adv_epsilon is None:
+            parser.error("--ricci-analysis requires --adv-epsilon")
+        adv_dir_ra = ADV_DIR / f"eps_{args.adv_epsilon:.3f}"
+        if not adv_dir_ra.exists():
+            raise FileNotFoundError(
+                f"{adv_dir_ra} not found. "
+                f"Run: uv run python scripts/generate_adversarial.py --epsilon {args.adv_epsilon}"
+            )
+        ra_layer_names = data["layer_names"]
+        missing_ra = [n for n in ra_layer_names if not (adv_dir_ra / f"{n}.npy").exists()]
+        if missing_ra:
+            raise FileNotFoundError(
+                f"Missing adversarial features for layers {missing_ra} in {adv_dir_ra}."
+            )
+        adv_feats_ra = {n: np.load(adv_dir_ra / f"{n}.npy") for n in ra_layer_names}
+        adv_labels_ra = np.load(adv_dir_ra / "labels.npy")
+        print(
+            f"\nComputing adversarial Ricci metrics for ε={args.adv_epsilon:.3f} "
+            f"({'Ollivier' if not args.skip_ollivier else 'Forman only'})..."
+        )
+        adv_metrics = compute_layer_metrics(
+            adv_feats_ra, adv_labels_ra,
+            knn_k=int(data.get("knn_k", 6)),
+            skip_ollivier=args.skip_ollivier,
+        )
+        ra_out = OUTPUTS_DIR / f"adversarial_ricci_eps{args.adv_epsilon:.3f}.png"
+        plot_adversarial_ricci_comparison(data, adv_metrics, ra_out, args.adv_epsilon)
+
     if not args.no_gif:
         labels = data["labels"]
         features = None
+        adv_features = None
+        adv_labels = None
 
-        # Only need raw features if UMAP projections are missing from the npz
-        if "umap_projections" not in data:
-            print("umap_projections not found in npz — loading features for UMAP...")
+        # Load adversarial features when requested
+        if args.adv_epsilon is not None:
+            adv_dir = ADV_DIR / f"eps_{args.adv_epsilon:.3f}"
+            if not adv_dir.exists():
+                raise FileNotFoundError(
+                    f"{adv_dir} not found. "
+                    f"Run: uv run python scripts/generate_adversarial.py "
+                    f"--epsilon {args.adv_epsilon}"
+                )
+            layer_names = data["layer_names"]
+            missing = [n for n in layer_names if not (adv_dir / f"{n}.npy").exists()]
+            if missing:
+                raise FileNotFoundError(
+                    f"Missing adversarial features for layers {missing} in {adv_dir}."
+                )
+            adv_features = {n: np.load(adv_dir / f"{n}.npy") for n in layer_names}
+            adv_labels = np.load(adv_dir / "labels.npy")
+            print(
+                f"Loaded adversarial features for ε={args.adv_epsilon:.3f} "
+                f"({next(iter(adv_features.values())).shape[0]} points, "
+                f"labels: {np.unique(adv_labels).tolist()})"
+            )
+
+        # Raw clean features are needed when UMAP must be (re)computed:
+        # either because projections aren't saved yet, or because the adversarial
+        # overlay forces a combined UMAP refit.
+        need_features = "umap_projections" not in data or adv_features is not None
+        if need_features:
+            reason = "adversarial overlay" if adv_features is not None else "missing umap_projections"
+            print(f"Loading clean features for UMAP ({reason})...")
             feature_dir = FEATURES_DIR / "full"
             label_path = feature_dir / "labels.npy"
             if label_path.exists():
@@ -513,10 +890,18 @@ def main() -> None:
             )
 
         knn_k = int(data.get("knn_k", 6))
+        gif_name = (
+            f"combined_manifold_adv{args.adv_epsilon:.3f}.gif"
+            if args.adv_epsilon is not None
+            else "combined_manifold.gif"
+        )
         make_combined_gif(
             data, features, labels,
-            OUTPUTS_DIR / "combined_manifold.gif",
+            OUTPUTS_DIR / gif_name,
             knn_k=knn_k,
+            adv_features=adv_features,
+            adv_epsilon=args.adv_epsilon,
+            adv_labels=adv_labels,
         )
 
 
