@@ -9,7 +9,7 @@ import umap
 
 def visualise_manifold(data: np.ndarray, n_components: int = 3) -> np.ndarray:
     """Project *data* to *n_components* dimensions with UMAP and return the embedding."""
-    reducer = umap.UMAP(n_components=n_components, n_neighbors=15, min_dist=0.1)
+    reducer = umap.UMAP(n_components=n_components, n_neighbors=15, min_dist=0.1, random_state=42)
     return reducer.fit_transform(data)
 
 
