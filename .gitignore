@@ -186,11 +186,41 @@ cython_debug/
 # ignore .gif
 *.gif
 
-#ignore outputs
-outputs/*
+# ---------------------------------------------------------------------------
+# Generated artefacts — all reproducible from code, none belong in git.
+# Each directory keeps a .gitkeep so the tree structure survives a fresh clone.
+# ---------------------------------------------------------------------------
 
-# ignore data
-data/*
-
-# ignore features
+# raw + cached activations
 features/*
+!features/.gitkeep
+
+# downloaded datasets
+data/*
+!data/.gitkeep
+
+# trained checkpoints (including HPC sweep output)
+weights/*
+!weights/.gitkeep
+
+# figures, GIFs, metric archives
+outputs/*
+!outputs/.gitkeep
+
+# Phase-1 sweep results: per-job .npz/.json shards and aggregated tables
+results/*
+!results/.gitkeep
+
+# Slurm stdout/stderr
+hpc/logs/*
+!hpc/logs/.gitkeep
+*.out
+*.err
+
+# Site-specific HPC settings — copy cluster.conf.example and edit locally
+hpc/cluster.conf
+
+# macOS
+.DS_Store
+._*
+.AppleDouble
